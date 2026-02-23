@@ -1,0 +1,51 @@
+[project]
+name = "secure-travel-agent"
+version = "0.1.0"
+description = "CaMeL + ADK + MCP sandboxed travel booking agent"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.0.0",
+  "anthropic>=0.40.0",
+  "python-dotenv>=1.0.0",
+  "aiohttp>=3.9.0",
+  "rich>=13.0.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0.0",
+  "pytest-asyncio>=0.21.0",
+  "ruff>=0.4.0",
+  "docent-python>=0.1.0",
+  "deepteam==0.2.3",
+  "nest-asyncio>=1.6.0",
+]
+adk = [
+  "google-adk>=0.5.0",
+]
+mcp = [
+  "mcp>=1.0.0",
+  "fastmcp>=0.1.0",
+]
+camel = [
+  "camel",
+]
+
+[tool.uv.sources]
+camel = { path = "../camel-prompt-injection", editable = true }
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "adk" },
+    { extra = "camel" },
+  ],
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+indent-width = 2
