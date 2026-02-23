@@ -337,11 +337,13 @@ class TrustBoundary:
       trace.final_status = "executed"
     except ValueError as e:
       err_msg = str(e).lower()
-      if "injection" in err_msg:
-        layer = "input_sandbox"
-        if "response" in err_msg:
-          layer = "output_sandbox"
-        trace.add(layer, "blocked", str(e))
+      if "injection" in err_msg and "response" in err_msg:
+        # Output sandbox caught injection in API response — layers 5-6 passed
+        trace.add("input_sandbox", "passed", "Parameters validated")
+        trace.add("api_sandbox", "passed", "API response sanitized")
+        trace.add("output_sandbox", "blocked", str(e))
+      elif "injection" in err_msg:
+        trace.add("input_sandbox", "blocked", str(e))
       else:
         trace.add("input_sandbox", "blocked", str(e))
       trace.final_status = "blocked"
