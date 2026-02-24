@@ -10,3 +10,4 @@ uv.lock
 *.egg-info/
 dist/
 build/
+lab-notes/

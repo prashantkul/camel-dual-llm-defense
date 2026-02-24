@@ -341,13 +341,17 @@ class TrustBoundary:
       trace.final_status = "blocked"
       return trace
 
-    # Layer 4: Privilege Check (injection / confirmation)
-    if token.injection_detected:
-      trace.add("privilege_check", "blocked", "Injection detected — execution refused")
+    # Layer 4: Privilege Check via CaMeL policy engine
+    primary_tool = tool_name_for_intent(token.intent)
+    policy_result = self.security_policy.check(primary_tool, token)
+    if isinstance(policy_result, Denied):
+      detail = policy_result.reason
+      trace.add("privilege_check", "blocked", detail)
       trace.final_status = "blocked"
 
       audit_entry = await self.audit_log.record_crossing(token)
-      self.audit_log.mark_outcome(audit_entry.crossing_id, "blocked_injection")
+      outcome = "blocked_injection" if token.injection_detected else "blocked_policy"
+      self.audit_log.mark_outcome(audit_entry.crossing_id, outcome)
       trace.audit_entry = audit_entry
 
       for layer_name in ("input_sandbox", "api_sandbox", "output_sandbox"):
@@ -366,15 +370,16 @@ class TrustBoundary:
         trace.add(layer_name, "skipped", "Not reached")
       return trace
 
-    trace.add("privilege_check", "passed", "No injection, no confirmation needed")
+    trace.add("privilege_check", "passed", "CaMeL policy: Allowed")
 
     # Layers 5-7: Execute with privilege (routes through sandboxes)
     try:
       audit_entry = await self.audit_log.record_crossing(token)
       trace.audit_entry = audit_entry
 
-      await self._route_to_agent(token)
+      agent_result = await self._route_to_agent(token)
       self.audit_log.mark_outcome(audit_entry.crossing_id, "executed")
+      trace.result = agent_result
 
       trace.add("input_sandbox", "passed", "Parameters validated")
       trace.add("api_sandbox", "passed", "API response sanitized")

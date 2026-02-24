@@ -36,6 +36,7 @@ class PipelineTrace:
   final_status: str = "pending"  # "executed", "blocked", "confirmation_required"
   token: Optional[CapabilityToken] = None
   audit_entry: Optional[AuditEntry] = None
+  result: Optional[dict[str, Any]] = None  # Actual agent execution result
 
   def add(self, name: str, status: str, detail: str, **data: Any) -> None:
     self.layers.append(LayerResult(name=name, status=status, detail=detail, data=data))

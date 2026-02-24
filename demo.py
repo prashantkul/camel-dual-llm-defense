@@ -71,10 +71,10 @@ LAYER_DISPLAY = {
   "pii_sanitizer": ("1", "PII Sanitizer", "Strips SSNs, credit cards, hashes licenses"),
   "quarantine_llm": ("2", "Quarantine LLM", "Claude parses input → CapabilityToken"),
   "token_validation": ("3", "Token Validation", "Pydantic validators, injection patterns"),
-  "privilege_check": ("4", "Privilege Check", "Injection gate + confirmation gate"),
+  "privilege_check": ("4", "CaMeL Policy Gate", "Taint-aware policy engine + confirmation gate"),
   "input_sandbox": ("5", "Input Sandbox", "Parameter allowlists, type/range checks"),
   "api_sandbox": ("6", "API Sandbox", "Response size limits, rate limiting"),
-  "output_sandbox": ("7", "Output Sandbox", "Field filtering, injection re-scan"),
+  "output_sandbox": ("7", "Output Sandbox", "Field filtering, injection re-scan + provenance tagging"),
 }
 
 LAYER_ORDER = [
@@ -249,10 +249,10 @@ LAYER_DETECTOR = {
   "pii_sanitizer": ("Sanitizer (regex engine)", "Pattern matching: SSN, credit card, license number regexes"),
   "quarantine_llm": ("Q-LLM (Claude Sonnet)", "LLM-based semantic analysis of raw user input"),
   "token_validation": ("Pydantic Validators", "Static pattern matching on CapabilityToken fields"),
-  "privilege_check": ("Trust Boundary Gate", "Policy check: injection_detected flag from Q-LLM"),
+  "privilege_check": ("CaMeL TravelSecurityPolicyEngine", "Taint-aware policy: token state + data provenance check"),
   "input_sandbox": ("Input Sandbox", "Parameter allowlists, type constraints, range validation"),
   "api_sandbox": ("API Sandbox", "Response size limits, rate limiting, schema validation"),
-  "output_sandbox": ("Output Sandbox", "Injection re-scan on outbound data, field filtering"),
+  "output_sandbox": ("Output Sandbox", "Injection re-scan on outbound data, CaMeL provenance tagging"),
 }
 
 
@@ -385,6 +385,7 @@ def build_plm_panel(trace: PipelineTrace) -> Panel:
   if priv_layer and priv_layer.status == "blocked":
     parts.append(Text("Action: ", style="bold") + Text("REFUSED execution", style="bold red"))
     parts.append(Text(f"  Reason: {priv_layer.detail}", style="red"))
+    parts.append(Text("  CaMeL policy engine returned: Denied", style="dim red"))
     parts.append(Text("  Token never crossed the trust boundary", style="dim"))
   elif priv_layer and priv_layer.status == "warning":
     parts.append(Text("Action: ", style="bold") + Text("PAUSED for confirmation", style="bold yellow"))
@@ -485,7 +486,7 @@ def build_agent_response(trace: PipelineTrace) -> Panel:
     detected_by.append(" — before any LLM was invoked", style="dim")
     parts.append(detected_by)
   elif priv_layer and priv_layer.status == "blocked":
-    # Blocked at privilege check — injection detected
+    # Blocked at privilege check — CaMeL policy denied
     parts.append(Text(
       "I've detected a potential security concern in your request. "
       "For safety, I'm unable to proceed with this action.",
@@ -502,7 +503,7 @@ def build_agent_response(trace: PipelineTrace) -> Panel:
     detected_by = Text()
     detected_by.append("Detected by: ", style="bold dim")
     detected_by.append("Q-LLM (Claude Sonnet)", style="bold red")
-    detected_by.append(" → enforced by Trust Boundary Gate", style="dim")
+    detected_by.append(" → enforced by CaMeL TravelSecurityPolicyEngine", style="dim")
     parts.append(detected_by)
     if trace.audit_entry:
       parts.append(Text(
@@ -548,12 +549,12 @@ def build_agent_response(trace: PipelineTrace) -> Panel:
       style="bold yellow",
     ))
   elif trace.final_status == "executed" and trace.token:
-    # Successful execution — show what the agent would say
+    # Successful execution — show actual results from the pipeline
     t = trace.token
     parts.append(Text("Great news! I've processed your request.", style="bold green"))
     parts.append(Text(""))
 
-    if t.intent.value == "search_car":
+    if t.intent.value == "search_car" and trace.result:
       location = t.pickup_location or "your selected location"
       pickup = t.pickup_date or "your selected dates"
       dropoff = t.dropoff_date or ""
@@ -565,13 +566,36 @@ def build_agent_response(trace: PipelineTrace) -> Panel:
       parts.append(Text(f"  Dates: {date_str}", style="cyan"))
       parts.append(Text(f"  Class: {car}", style="cyan"))
       parts.append(Text(""))
+
+      # Display actual results from CarSearchEngine → sandbox pipeline
+      cars = trace.result.get("cars", [])
+      total = trace.result.get("total_results", len(cars))
       parts.append(Text(
-        "Here are the available vehicles (via sandboxed CarSearchEngine):",
+        f"Available vehicles ({total} results via sandboxed CarSearchEngine):",
         style="dim",
       ))
-      parts.append(Text("  1. Economy Sedan — $45/day", style="green"))
-      parts.append(Text("  2. Midsize SUV — $65/day", style="green"))
-      parts.append(Text("  3. Full-size Sedan — $55/day", style="green"))
+      for i, car_data in enumerate(cars, 1):
+        make = car_data.get("make", "Unknown")
+        model = car_data.get("model", "")
+        year = car_data.get("year", "")
+        car_cls = car_data.get("class", "")
+        rate = car_data.get("daily_rate_cents", 0)
+        rate_str = f"${rate / 100:.0f}/day" if rate else ""
+        parts.append(Text(
+          f"  {i}. {make} {model} {year} ({car_cls}) — {rate_str}",
+          style="green",
+        ))
+
+      # Show provenance metadata if present
+      camel_meta = trace.result.get("_camel_metadata")
+      if camel_meta:
+        parts.append(Text(""))
+        parts.append(Text(
+          f"  CaMeL provenance: source={camel_meta['source']}, "
+          f"trusted={camel_meta['trusted']}",
+          style="dim magenta",
+        ))
+
       if t.license_number_hash:
         parts.append(Text(""))
         parts.append(Text(
@@ -733,7 +757,9 @@ User Input
   │
   ├─[3]─ Token Validation ───── Pydantic validators + injection patterns
   │
-  ├─[4]─ Privilege Check ────── Injection gate + confirmation gate
+  ├─[4]─ CaMeL Policy Gate ──── TravelSecurityPolicyEngine (taint-aware)
+  │       Uses camel.security_policy.Allowed/Denied
+  │       + CaMeLStr taint tracking for data provenance
   │
   │  ═══ TRUST BOUNDARY ═══     (only CapabilityTokens cross)
   │
@@ -742,7 +768,7 @@ User Input
   ├─[6]─ API Sandbox ────────── Response size limits, rate limiting
   │
   └─[7]─ Output Sandbox ─────── Field filtering, injection re-scan
-          │
+          │                      + CaMeL ToolSource provenance tagging
           ▼
       P-LLM: Privileged LLM (GPT-5-mini via ADK + LiteLLM)
       (has tool access, but NEVER sees raw user input)
@@ -750,7 +776,8 @@ User Input
 
 **Key principle:** The P-LLM *never* sees raw user input.
 The Q-LLM parses it into a structured `CapabilityToken` — the only
-artifact allowed to cross the trust boundary.
+artifact allowed to cross the trust boundary. The CaMeL policy engine
+gates execution using taint-tracked data provenance (not just flags).
 """
   console.print(Markdown(arch_md))
 
