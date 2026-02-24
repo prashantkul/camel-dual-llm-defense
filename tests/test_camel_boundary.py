@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
+from camel.security_policy import Allowed, Denied
 
 from trust_layer.audit_log import AuditLog
 from trust_layer.capability_tokens import (
@@ -15,7 +16,7 @@ from trust_layer.capability_tokens import (
   hash_license,
 )
 from trust_layer.sanitizer import Sanitizer
-from trust_layer.trust_boundary import TrustBoundary
+from trust_layer.trust_boundary import TravelSecurityPolicyEngine, TrustBoundary
 
 
 class TestCapabilityTokens:
@@ -186,3 +187,120 @@ class TestTrustBoundary:
     result = await boundary.execute_with_privilege(token)
     assert result["status"] == "blocked"
     assert "injection" in result["reason"].lower()
+
+  @pytest.mark.asyncio
+  async def test_execute_uses_policy_engine(self):
+    """Verify execute_with_privilege routes through the CaMeL policy engine."""
+    AuditLog.reset()
+    boundary = TrustBoundary()
+    # Write tool without confirmation should be denied by policy
+    token = CapabilityToken(
+      intent=TravelIntent.BOOK_CAR,
+      risk_level=RiskLevel.LOW,
+      user_confirmation_required=False,
+      injection_detected=False,
+    )
+    result = await boundary.execute_with_privilege(token)
+    assert result["status"] == "blocked"
+    assert "requires user confirmation" in result["reason"]
+
+
+class TestTravelSecurityPolicyEngine:
+  """Tests for the CaMeL-integrated security policy engine."""
+
+  def setup_method(self):
+    self.policy = TravelSecurityPolicyEngine()
+
+  def test_check_returns_real_allowed(self):
+    token = CapabilityToken(
+      intent=TravelIntent.SEARCH_CAR,
+      risk_level=RiskLevel.LOW,
+    )
+    result = self.policy.check("search_rental_cars", token)
+    assert isinstance(result, Allowed)
+
+  def test_check_returns_real_denied_on_injection(self):
+    token = CapabilityToken(
+      intent=TravelIntent.SEARCH_CAR,
+      risk_level=RiskLevel.HIGH,
+      injection_detected=True,
+      user_confirmation_required=True,
+    )
+    result = self.policy.check("search_rental_cars", token)
+    assert isinstance(result, Denied)
+    assert "injection" in result.reason.lower()
+
+  def test_write_tool_denied_without_confirmation(self):
+    token = CapabilityToken(
+      intent=TravelIntent.BOOK_CAR,
+      risk_level=RiskLevel.LOW,
+    )
+    result = self.policy.check("book_car", token)
+    assert isinstance(result, Denied)
+    assert "requires user confirmation" in result.reason
+
+  def test_write_tool_allowed_with_confirmation(self):
+    token = CapabilityToken(
+      intent=TravelIntent.BOOK_CAR,
+      risk_level=RiskLevel.LOW,
+      user_confirmation_required=True,
+    )
+    result = self.policy.check("book_car", token)
+    assert isinstance(result, Allowed)
+
+  def test_unknown_tool_denied(self):
+    token = CapabilityToken(
+      intent=TravelIntent.SEARCH_CAR,
+      risk_level=RiskLevel.LOW,
+    )
+    result = self.policy.check("unknown_tool", token)
+    assert isinstance(result, Denied)
+    assert "unknown" in result.reason.lower()
+
+  def test_check_tool_args_trusted_allowed(self):
+    """User-sourced CaMeLStr values should pass taint check for read tools."""
+    from camel.capabilities import Capabilities
+    from camel.interpreter.value import CaMeLStr
+
+    metadata = Capabilities.default()  # Source=User
+    kwargs = {
+      "pickup_location": CaMeLStr.from_raw("SFO", metadata, ()),
+    }
+    result = self.policy.check_tool_args("search_rental_cars", kwargs)
+    assert isinstance(result, Allowed)
+
+  def test_check_tool_args_untrusted_denied_for_write(self):
+    """Tool-sourced CaMeLStr values should be denied for write tools."""
+    from camel.capabilities import Capabilities
+    from camel.capabilities.readers import Public
+    from camel.capabilities.sources import Tool as ToolSource
+    from camel.interpreter.value import CaMeLStr
+
+    tool_source = ToolSource(tool_name="external_api", inner_sources=frozenset())
+    metadata = Capabilities(frozenset({tool_source}), Public())
+    kwargs = {
+      "pickup_location": CaMeLStr.from_raw("SFO", metadata, ()),
+    }
+    result = self.policy.check_tool_args("book_car", kwargs)
+    assert isinstance(result, Denied)
+    assert "trusted source" in result.reason
+
+  def test_token_as_camel_kwargs(self):
+    """CapabilityToken.as_camel_kwargs() produces properly tagged CaMeLStr values."""
+    from camel.capabilities import is_trusted
+    from camel.interpreter.value import CaMeLStr
+
+    token = CapabilityToken(
+      intent=TravelIntent.SEARCH_CAR,
+      risk_level=RiskLevel.LOW,
+      pickup_location="SFO",
+      dropoff_location="LAX",
+      car_class="midsize",
+    )
+    kwargs = token.as_camel_kwargs()
+    assert "pickup_location" in kwargs
+    assert "dropoff_location" in kwargs
+    assert "car_class" in kwargs
+    for val in kwargs.values():
+      assert isinstance(val, CaMeLStr)
+      assert is_trusted(val)

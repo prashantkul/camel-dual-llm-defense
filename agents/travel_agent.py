@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from camel.security_policy import Denied
+
 from trust_layer.capability_tokens import CapabilityToken, TravelIntent
 from trust_layer.config import load_config, load_full_config, resolve_adk_model
+from trust_layer.trust_boundary import TravelSecurityPolicyEngine
 
 try:
   _, _adk_config = load_config()
@@ -86,6 +89,9 @@ async def route_capability_token(token: CapabilityToken) -> dict[str, Any]:
     return {"status": "error", "message": f"Unknown intent: {token.intent}"}
 
 
+_policy = TravelSecurityPolicyEngine()
+
+
 async def _handle_car_search(token: CapabilityToken) -> dict[str, Any]:
   """Handle car search via MCP server (sandboxed)."""
   from mcp_server.sandbox.api_sandbox import APISandbox
@@ -93,6 +99,17 @@ async def _handle_car_search(token: CapabilityToken) -> dict[str, Any]:
   from mcp_server.sandbox.output_sandbox import OutputSandbox
   from mcp_server.tools.car_search import CarSearchEngine
   from mcp_server.tools.license_validator import LicenseValidator
+
+  # CaMeL policy check on token
+  result = _policy.check("search_rental_cars", token)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
+
+  # CaMeL taint check on arguments
+  camel_kwargs = token.as_camel_kwargs()
+  result = _policy.check_tool_args("search_rental_cars", camel_kwargs)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
 
   input_sb = InputSandbox()
   output_sb = OutputSandbox()
@@ -124,6 +141,17 @@ async def _handle_car_search(token: CapabilityToken) -> dict[str, Any]:
 
 
 async def _handle_car_booking(token: CapabilityToken) -> dict[str, Any]:
+  # CaMeL policy check — write tool requires confirmation
+  result = _policy.check("book_car", token)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
+
+  # CaMeL taint check on arguments
+  camel_kwargs = token.as_camel_kwargs()
+  result = _policy.check_tool_args("book_car", camel_kwargs)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
+
   return {
     "status": "confirmation_required",
     "message": "Car booking requires user confirmation",
@@ -132,6 +160,17 @@ async def _handle_car_booking(token: CapabilityToken) -> dict[str, Any]:
 
 
 async def _handle_payment(token: CapabilityToken) -> dict[str, Any]:
+  # CaMeL policy check — write tool requires confirmation
+  result = _policy.check("process_payment", token)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
+
+  # CaMeL taint check on arguments
+  camel_kwargs = token.as_camel_kwargs()
+  result = _policy.check_tool_args("process_payment", camel_kwargs)
+  if isinstance(result, Denied):
+    return {"status": "blocked", "reason": result.reason}
+
   return {
     "status": "confirmation_required",
     "message": "Payment processing requires user confirmation and PaymentToken",

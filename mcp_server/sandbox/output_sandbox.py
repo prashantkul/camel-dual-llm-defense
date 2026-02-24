@@ -8,8 +8,24 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
+from camel.capabilities import Capabilities
+from camel.capabilities.sources import Tool as ToolSource
+from camel.capabilities.readers import Public
+
 if TYPE_CHECKING:
   from trust_layer.config import OutputSandboxConfig
+
+
+def tag_output_provenance(sanitized: dict[str, Any], tool_name: str) -> dict[str, Any]:
+  """Tag sanitized output values with CaMeL tool-source provenance."""
+  source = ToolSource(tool_name=tool_name, inner_sources=frozenset())
+  # Build metadata for downstream taint checking
+  _metadata = Capabilities(frozenset({source}), Public())
+  sanitized["_camel_metadata"] = {
+    "source": tool_name,
+    "trusted": False,  # External API responses are untrusted
+  }
+  return sanitized
 
 
 class OutputSandbox:
@@ -71,11 +87,12 @@ class OutputSandbox:
 
       safe_cars.append(safe_car)
 
-    return {
+    output = {
       "cars": safe_cars,
       "total_results": len(safe_cars),
       "search_id": str(results.get("search_id", ""))[:36],
     }
+    return tag_output_provenance(output, "search_rental_cars")
 
   async def filter_license_result(self, result: dict) -> dict:
     """Filter license validation result."""
@@ -90,9 +107,25 @@ class OutputSandbox:
 
   def _check_response_injection(self, value: str, field: str) -> None:
     """Check if third-party API response contains injection attempts."""
+    # Regex-based pattern matching
     for pattern in self.RESPONSE_INJECTION_PATTERNS:
       if re.search(pattern, value, re.IGNORECASE):
         raise ValueError(
           f"Response injection pattern in {field} — "
+          "third-party API may be compromised"
+        )
+
+    # GLiNER semantic scan (defense-in-depth: catches attacks that evade regex)
+    from trust_layer.gliner_layer import GLiNERLayer
+
+    gliner = GLiNERLayer.get_instance()
+    if gliner.is_available():
+      scan_result = gliner.scan_response(value)
+      if scan_result is not None and scan_result.label in (
+        "injection_attempt",
+        "data_exfiltration",
+      ):
+        raise ValueError(
+          f"Response injection detected by GLiNER in {field} — "
           "third-party API may be compromised"
         )

@@ -9,6 +9,19 @@ from trust_layer.audit_log import AuditEntry
 from trust_layer.capability_tokens import CapabilityToken
 
 
+# Recognized layer names for pipeline tracing
+LAYER_NAMES = (
+  "pii_sanitizer",
+  "gliner_extraction",
+  "quarantine_llm",
+  "token_validation",
+  "privilege_check",
+  "input_sandbox",
+  "api_sandbox",
+  "output_sandbox",
+)
+
+
 @dataclass
 class LayerResult:
   name: str

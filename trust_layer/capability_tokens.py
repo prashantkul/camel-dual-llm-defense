@@ -9,6 +9,9 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from camel.capabilities import Capabilities
+from camel.interpreter.value import CaMeLStr
+
 
 class TravelIntent(str, Enum):
   SEARCH_FLIGHTS = "search_flights"
@@ -80,6 +83,40 @@ class CapabilityToken(BaseModel):
               f"Injection pattern detected in parameter '{key}'"
             )
     return v
+
+  def as_camel_kwargs(self) -> dict[str, CaMeLStr]:
+    """Wrap token fields as CaMeLValues with User source provenance."""
+    metadata = Capabilities.default()  # Source=User, Readers=Public
+    result: dict[str, CaMeLStr] = {}
+    if self.pickup_location:
+      result["pickup_location"] = CaMeLStr.from_raw(
+        self.pickup_location, metadata, ()
+      )
+    if self.dropoff_location:
+      result["dropoff_location"] = CaMeLStr.from_raw(
+        self.dropoff_location, metadata, ()
+      )
+    if self.car_class:
+      result["car_class"] = CaMeLStr.from_raw(
+        self.car_class, metadata, ()
+      )
+    if self.license_number_hash:
+      result["license_hash"] = CaMeLStr.from_raw(
+        self.license_number_hash, metadata, ()
+      )
+    if self.license_state:
+      result["license_state"] = CaMeLStr.from_raw(
+        self.license_state, metadata, ()
+      )
+    if self.pickup_date:
+      result["pickup_date"] = CaMeLStr.from_raw(
+        str(self.pickup_date), metadata, ()
+      )
+    if self.dropoff_date:
+      result["dropoff_date"] = CaMeLStr.from_raw(
+        str(self.dropoff_date), metadata, ()
+      )
+    return result
 
   @field_validator("license_number_hash")
   @classmethod

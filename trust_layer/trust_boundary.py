@@ -16,26 +16,19 @@ import anthropic
 
 from anthropic_tools.tool_definitions import EMIT_CAPABILITY_TOKEN_TOOL, extract_tool_use
 from anthropic_tools.tool_executor import validate_and_build_token
-try:
-  from camel.security_policy import Allowed, Denied, SecurityPolicyEngine  # noqa: F401
-  CAMEL_AVAILABLE = True
-except ImportError:
-  CAMEL_AVAILABLE = False
-
-  class Allowed:  # type: ignore[no-redef]
-    pass
-
-  class Denied:  # type: ignore[no-redef]
-    def __init__(self, reason: str = ""):
-      self.reason = reason
+from camel.security_policy import Allowed, Denied, SecurityPolicyResult
+from camel.capabilities import is_trusted
+from camel.interpreter.value import CaMeLStr
 
 from trust_layer.audit_log import AuditLog
 from trust_layer.capability_tokens import (
   CapabilityToken,
   RiskLevel,
+  TravelIntent,
   configure_token_patterns,
 )
 from trust_layer.config import CamelConfig, SecurityConfig, load_config
+from trust_layer.gliner_layer import GLiNERLayer
 from trust_layer.sanitizer import Sanitizer
 from trust_layer.trace import PipelineTrace
 
@@ -72,16 +65,32 @@ _DEFAULT_OFFLINE_INJECTION_KEYWORDS = [
 ]
 
 
+_INTENT_TO_TOOL: dict[TravelIntent, str] = {
+  TravelIntent.SEARCH_CAR: "search_rental_cars",
+  TravelIntent.BOOK_CAR: "book_car",
+  TravelIntent.PROCESS_PAYMENT: "process_payment",
+  TravelIntent.GET_ITINERARY: "get_itinerary",
+  TravelIntent.CANCEL_BOOKING: "cancel_booking",
+  TravelIntent.SEARCH_FLIGHTS: "search_flights",
+}
+
+
+def tool_name_for_intent(intent: TravelIntent) -> str:
+  """Map a TravelIntent to its primary tool name."""
+  return _INTENT_TO_TOOL.get(intent, intent.value)
+
+
 class TravelSecurityPolicyEngine:
   """
-  Security policy engine for the travel domain.
-  Uses CaMeL's SecurityPolicyEngine protocol to gate tool execution.
+  Security policy engine using CaMeL's taint tracking.
+  Gates tool execution based on data provenance, not just token flags.
   """
 
   SAFE_READ_TOOLS = {"search_rental_cars", "validate_driver_license", "get_itinerary"}
   WRITE_TOOLS = {"book_car", "process_payment", "cancel_booking"}
 
-  def check(self, tool_name: str, token: CapabilityToken) -> Allowed | Denied:
+  def check(self, tool_name: str, token: CapabilityToken) -> SecurityPolicyResult:
+    """Check if tool execution is allowed based on token state."""
     if token.injection_detected:
       return Denied("Injection detected — all tool access denied")
     if tool_name in self.SAFE_READ_TOOLS:
@@ -91,6 +100,23 @@ class TravelSecurityPolicyEngine:
         return Denied(f"Write tool '{tool_name}' requires user confirmation")
       return Allowed()
     return Denied(f"Unknown tool '{tool_name}' — denied by default")
+
+  def check_tool_args(
+    self, tool_name: str, kwargs: dict[str, CaMeLStr]
+  ) -> SecurityPolicyResult:
+    """
+    CaMeL-style taint check: verify tool arguments come from trusted sources.
+    Write tools require all arguments to be user-originated or CaMeL-computed.
+    """
+    if tool_name in self.SAFE_READ_TOOLS:
+      return Allowed()
+    for arg_name, arg_value in kwargs.items():
+      if not is_trusted(arg_value):
+        return Denied(
+          f"Argument '{arg_name}' for write tool '{tool_name}' "
+          f"does not come from a trusted source"
+        )
+    return Allowed()
 
 
 class TrustBoundary:
@@ -169,6 +195,20 @@ class TrustBoundary:
         f"{pii_hashes['license_number_hash']}"
       )
 
+    # P2: Pre-extract entities/intent with GLiNER to reduce Q-LLM token usage
+    gliner = GLiNERLayer.get_instance()
+    if gliner.is_available():
+      intent_result = gliner.classify_intent(raw_input)
+      entities = gliner.extract_entities(raw_input)
+      pre_context_parts = []
+      if intent_result is not None:
+        pre_context_parts.append(f"Pre-extracted intent: {intent_result.label}")
+      if entities:
+        entity_strs = [f"{e.label}={e.text}" for e in entities]
+        pre_context_parts.append(f"Pre-extracted entities: {', '.join(entity_strs)}")
+      if pre_context_parts:
+        system_prompt += "\n\n" + "\n".join(pre_context_parts)
+
     if self.quarantined_client is None:
       return self._offline_parse(raw_input, pii_hashes)
 
@@ -195,16 +235,21 @@ class TrustBoundary:
     """
     Privileged side. Never sees raw user input.
     Routes CapabilityToken to the appropriate ADK agent.
+    Uses CaMeL security policy engine for access control.
     """
     self._validate_token_integrity(token)
 
     audit_entry = await self.audit_log.record_crossing(token)
 
-    if token.injection_detected:
-      self.audit_log.mark_outcome(audit_entry.crossing_id, "blocked_injection")
+    # Use CaMeL security policy engine instead of inline checks
+    primary_tool = tool_name_for_intent(token.intent)
+    result = self.security_policy.check(primary_tool, token)
+    if isinstance(result, Denied):
+      outcome = "blocked_injection" if token.injection_detected else "blocked_policy"
+      self.audit_log.mark_outcome(audit_entry.crossing_id, outcome)
       return {
         "status": "blocked",
-        "reason": "Injection attack detected in quarantine layer",
+        "reason": result.reason,
         "crossing_id": audit_entry.crossing_id,
       }
 
@@ -223,9 +268,9 @@ class TrustBoundary:
         "crossing_id": audit_entry.crossing_id,
       }
 
-    result = await self._route_to_agent(token)
+    agent_result = await self._route_to_agent(token)
     self.audit_log.mark_outcome(audit_entry.crossing_id, "executed")
-    return result
+    return agent_result
 
   async def _route_to_agent(self, token: CapabilityToken) -> dict[str, Any]:
     """Route token to the appropriate ADK agent based on intent."""
@@ -371,8 +416,13 @@ class TrustBoundary:
   ) -> CapabilityToken:
     """
     Fallback parser when no Anthropic API key is available.
-    Uses simple heuristics — NOT secure for production.
+    Tries GLiNER first for semantic classification, falls back to keyword heuristics.
     """
+    gliner = GLiNERLayer.get_instance()
+    if gliner.is_available():
+      return self._gliner_parse(raw_input, pii_hashes, gliner)
+
+    # Keyword fallback — NOT secure for production
     raw_lower = raw_input.lower()
 
     injection_detected = any(
@@ -402,6 +452,71 @@ class TrustBoundary:
       "parameters": {},
     }
 
+    if "license_number_hash" in pii_hashes:
+      token_data["license_number_hash"] = pii_hashes["license_number_hash"]
+
+    return CapabilityToken(**token_data)
+
+  def _gliner_parse(
+    self,
+    raw_input: str,
+    pii_hashes: dict[str, str],
+    gliner: GLiNERLayer,
+  ) -> CapabilityToken:
+    """Parse user input using GLiNER2 for intent, safety, and entity extraction."""
+    # Classify intent
+    intent_result = gliner.classify_intent(raw_input)
+    if intent_result is not None:
+      try:
+        intent = TravelIntent(intent_result.label)
+      except ValueError:
+        intent = TravelIntent.SEARCH_CAR
+    else:
+      intent = TravelIntent.SEARCH_CAR
+
+    # Classify safety
+    injection_detected = False
+    safety_result = gliner.classify_safety(raw_input)
+    if safety_result is not None and safety_result.label in (
+      "prompt_injection",
+      "sql_injection",
+      "data_exfiltration",
+    ):
+      injection_detected = True
+
+    # Extract entities
+    pickup_location = None
+    dropoff_location = None
+    car_class = None
+
+    entities = gliner.extract_entities(raw_input)
+    if entities:
+      locations = [e for e in entities if e.label == "location"]
+      car_classes = [e for e in entities if e.label == "car_class"]
+
+      if locations:
+        pickup_location = locations[0].text
+      if len(locations) > 1:
+        dropoff_location = locations[1].text
+      if car_classes:
+        car_class = car_classes[0].text.lower()
+
+    risk = "high" if injection_detected else "low"
+
+    token_data: dict[str, Any] = {
+      "intent": intent.value,
+      "risk_level": risk,
+      "user_confirmation_required": injection_detected,
+      "injection_detected": injection_detected,
+      "parameters": {},
+    }
+
+    if pickup_location:
+      token_data["pickup_location"] = pickup_location
+    if dropoff_location:
+      token_data["dropoff_location"] = dropoff_location
+    if car_class:
+      token_data["car_class"] = car_class
     if "license_number_hash" in pii_hashes:
       token_data["license_number_hash"] = pii_hashes["license_number_hash"]
 

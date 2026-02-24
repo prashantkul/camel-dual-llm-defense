@@ -21,6 +21,9 @@ dev = [
   "deepteam==0.2.3",
   "nest-asyncio>=1.6.0",
 ]
+gliner = [
+  "gliner2",
+]
 adk = [
   "google-adk>=0.5.0",
 ]
